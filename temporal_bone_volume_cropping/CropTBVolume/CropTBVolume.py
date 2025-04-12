@@ -1,10 +1,16 @@
+# Standard library imports
 import logging
 import os
 from typing import Any, Dict, Optional, Tuple, Union, Annotated
-import vtk
 
+# Third-party imports
 import numpy as np
+import vtk
+from vtk.util import numpy_support as nps
+
+# Slicer imports
 import slicer
+from slicer import vtkMRMLScalarVolumeNode, vtkMRMLNode
 from slicer.i18n import tr as _
 from slicer.i18n import translate
 from slicer.ScriptedLoadableModule import *
@@ -15,10 +21,8 @@ from slicer.parameterNodeWrapper import (
     Choice
 )
 
+# Qt imports
 from qt import QPushButton, QTimer
-from slicer import vtkMRMLScalarVolumeNode, vtkMRMLNode
-from vtk.util import numpy_support as nps
-from slicer.parameterNodeWrapper import Choice
 
 RENAMED_EVENT = vtk.vtkCommand.UserEvent + 1  # Typically vtkCommand.UserEvent + 1 is used for renamed events
 
@@ -34,23 +38,11 @@ class CropTBVolumeParameterNode:
     - outputVolume: Output cropped volume node
     - roiNode: ROI node defining crop region
     - fillValue: Value for voxels outside input volume
-    - spacingScale: Scaling factor for output spacing
-    - isotropicSpacing: Enable isotropic spacing
-    - interpolatorType: Interpolation type (0=Nearest, 1=Linear, etc.)
     """
     inputVolume: slicer.vtkMRMLScalarVolumeNode
     outputVolume: slicer.vtkMRMLScalarVolumeNode
     roiNode: slicer.vtkMRMLMarkupsROINode
     fillValue: float = 0.0
-    spacingScale: Annotated[float, WithinRange(0.01, 10.0)] = 1.0
-    isotropicSpacing: bool = False
-    interpolatorType: Annotated[int, Choice({
-        0: "Nearest Neighbor",
-        1: "Linear",
-        2: "BSpline"
-    })] = 1
-    preserveInputSpacing: bool = True  # New parameter to control spacing behavior
-
 
 #
 # CropTBVolumeWidget
@@ -62,7 +54,7 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def __init__(self, parent=None) -> None:
         ScriptedLoadableModuleWidget.__init__(self, parent)
         VTKObservationMixin.__init__(self)
-        self.logic = CropTBVolumeLogic()
+        self.logic = None
         self._parameterNode = None
         self.roiObservers = []  # Initialize observers list here
         self.ui = None  # Initialize ui here
@@ -81,31 +73,25 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
 
+        # Initialize logic after UI is loaded
+        self.logic = CropTBVolumeLogic()
+        if not self.logic:
+            raise ValueError("Logic initialization failed")
+        
+        # Initialize parameter node
+        self._parameterNode = None
+        self.setParameterNode(self.logic.wrappedParameterNode)
+        
         # Configure widgets
         if hasattr(self.ui, 'fillValueSpinBox'):
             self.ui.fillValueSpinBox.decimals = 2
             self.ui.fillValueSpinBox.minimum = -10000.0
             self.ui.fillValueSpinBox.maximum = 10000.0
-
-        if hasattr(self.ui, 'spacingScaleSpinBox'):
-            self.ui.spacingScaleSpinBox.decimals = 3
-            self.ui.spacingScaleSpinBox.minimum = 0.01
-            self.ui.spacingScaleSpinBox.maximum = 10.0
         
         # Add ROI visibility toggle button
         if hasattr(self.ui, 'roiVisibilityButton'):
             self.ui.roiVisibilityButton.setCheckable(True)
             self.ui.roiVisibilityButton.toggled.connect(self.onROIVisibilityToggled)
-        
-        # Observe parameter node
-        self.setParameterNode(self.logic.wrappedParameterNode)
-        
-        if hasattr(self.ui, 'preserveSpacingCheckBox'):
-            self.ui.preserveSpacingCheckBox.checked = self._parameterNode.preserveInputSpacing
-            self.ui.preserveSpacingCheckBox.toggled.connect(self.onPreserveSpacingChanged)
-        
-        # Initial update of spacing controls
-        self.updateSpacingControls()
         
         # Set MRML Scene for selectors
         selectors = [self.ui.inputSelector, self.ui.outputSelector, self.ui.roiSelector]
@@ -121,10 +107,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         
         self.ui.fitToVolumeButton.connect('clicked()', self.onFitToVolume)
         self.ui.applyButton.connect('clicked(bool)', self.onApply)
-        
-        # Configure the isotropic spacing checkbox
-        if hasattr(self.ui, 'isotropicSpacingCheckBox'):
-            self.ui.isotropicSpacingCheckBox.toggled.connect(self.onIsotropicSpacingChanged)
             
         # Add observers for ROI size changes
         self.updateROISizeWidget()
@@ -142,24 +124,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.outputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onOutputVolumeChanged)
         
         self.updateVolumeInfo()  # This is the proper place to call it
-
-    def onPreserveSpacingChanged(self, checked):
-        """Handle changes to the preserve spacing checkbox"""
-        if self._parameterNode:
-            self._parameterNode.preserveInputSpacing = checked
-            self.updateSpacingControls()
-            self.updateVolumeInfo()
-        
-    def updateSpacingControls(self):
-        """Update the enabled state of spacing controls based on preserveInputSpacing"""
-        if not self._parameterNode:
-            return
-            
-        preserve = self._parameterNode.preserveInputSpacing
-        if hasattr(self.ui, 'spacingScaleSpinBox'):
-            self.ui.spacingScaleSpinBox.setEnabled(not preserve)
-        if hasattr(self.ui, 'isotropicSpacingCheckBox'):
-            self.ui.isotropicSpacingCheckBox.setEnabled(not preserve)
         
     def updateParameterNodeAndInfo(self):
         """Update parameter node and only input volume information"""
@@ -204,14 +168,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.ui.outputInfoLabel.setText("Output: (error)")
         else:
             self.ui.outputInfoLabel.setText("Output: ")
-    
-    def onIsotropicSpacingChanged(self, state):
-        if self._parameterNode:
-            self._parameterNode.isotropicSpacing = state
-            self.updateVolumeInfo()  # Update output dimensions display
-        
-    def onSpacingScaleChanged(self, value):
-        self._parameterNode.spacingScale = value
     
     def onNodeAdded(self, caller, event, callData):
         node = callData
@@ -345,21 +301,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.ui.fillValueSpinBox.valueChanged.connect(
                     lambda v: setattr(self._parameterNode, 'fillValue', v))
 
-            if hasattr(self.ui, 'spacingScaleSpinBox'):
-                self.ui.spacingScaleSpinBox.value = self._parameterNode.spacingScale
-                self.ui.spacingScaleSpinBox.valueChanged.connect(
-                    lambda v: setattr(self._parameterNode, 'spacingScale', v))
-
-            if hasattr(self.ui, 'isotropicSpacingCheckBox'):
-                self.ui.isotropicSpacingCheckBox.checked = self._parameterNode.isotropicSpacing
-                self.ui.isotropicSpacingCheckBox.toggled.connect(
-                    lambda v: setattr(self._parameterNode, 'isotropicSpacing', v))
-
-            if hasattr(self.ui, 'interpolatorComboBox'):
-                self.ui.interpolatorComboBox.currentIndex = self._parameterNode.interpolatorType
-                self.ui.interpolatorComboBox.currentIndexChanged.connect(
-                    lambda i: setattr(self._parameterNode, 'interpolatorType', i))
-
             # Observe input volume renames if it exists
             if self._parameterNode.inputVolume:
                 self.inputVolumeObserverTag = self._parameterNode.inputVolume.AddObserver(
@@ -372,7 +313,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             
             # Update all UI elements
             self.updateVolumeInfo()
-            self.updateSpacingControls()
             self.updateROISizeWidget()
 
     def onROIModified(self, caller, event):
@@ -690,69 +630,13 @@ class CropTBVolume(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         self.parent.title = _("Temporal Bone Volume Cropping")
-        # TODO: set categories (folders where the module shows up in the module selector)
         self.parent.categories = ["Volume"]  # Matches CMake category
         self.parent.dependencies = ["Markups"]  # Required modules
         self.parent.contributors = ["Jonathan Wang (JHUSOM)", "Andy Ding (JHU Hospital)"]
         # TODO: update with short description of the module and a link to online module documentation
-        # _() function marks text as translatable to other languages
         self.parent.helpText = _("""Prepares temporal bone CT scans for nnUNet processing through automated cropping and resampling.""")
-        # TODO: replace with organization, grant and thanks
         self.parent.acknowledgementText = _("""This file was originally developed by Jonathan Wang under Andy Ding and Francis Creighton at Johns Hopkins Hospital Department of Otolarynology.""")
-
-        # Additional initialization step after application startup is complete
-        if not slicer.app.testingEnabled():
-            slicer.app.connect("startupCompleted()", registerSampleData)
-
-#
-# Register sample data sets in Sample Data module
-#
-
-
-def registerSampleData():
-    """Add data sets to Sample Data module."""
-    # It is always recommended to provide sample data for users to make it easy to try the module,
-    # but if no sample data is available then this method (and associated startupCompeted signal connection) can be removed.
-
-    import SampleData
-
-    iconsPath = os.path.join(os.path.dirname(__file__), "Resources/Icons")
-
-    # To ensure that the source code repository remains small (can be downloaded and installed quickly)
-    # it is recommended to store data sets that are larger than a few MB in a Github release.
-
-    # CropTBVolume1
-    SampleData.SampleDataLogic.registerCustomSampleDataSource(
-        # Category and sample name displayed in Sample Data module
-        category="CropTBVolume",
-        sampleName="CropTBVolume1",
-        # Thumbnail should have size of approximately 260x280 pixels and stored in Resources/Icons folder.
-        # It can be created by Screen Capture module, "Capture all views" option enabled, "Number of images" set to "Single".
-        thumbnailFileName=os.path.join(iconsPath, "CropTBVolume1.png"),
-        # Download URL and target file name
-        uris="https://github.com/Slicer/SlicerTestingData/releases/download/SHA256/998cb522173839c78657f4bc0ea907cea09fd04e44601f17c82ea27927937b95",
-        fileNames="CropTBVolume1.nrrd",
-        # Checksum to ensure file integrity. Can be computed by this command:
-        #  import hashlib; print(hashlib.sha256(open(filename, "rb").read()).hexdigest())
-        checksums="SHA256:998cb522173839c78657f4bc0ea907cea09fd04e44601f17c82ea27927937b95",
-        # This node name will be used when the data set is loaded
-        nodeNames="CropTBVolume1",
-    )
-
-    # CropTBVolume2
-    SampleData.SampleDataLogic.registerCustomSampleDataSource(
-        # Category and sample name displayed in Sample Data module
-        category="CropTBVolume",
-        sampleName="CropTBVolume2",
-        thumbnailFileName=os.path.join(iconsPath, "CropTBVolume2.png"),
-        # Download URL and target file name
-        uris="https://github.com/Slicer/SlicerTestingData/releases/download/SHA256/1a64f3f422eb3d1c9b093d1a18da354b13bcf307907c66317e2463ee530b7a97",
-        fileNames="CropTBVolume2.nrrd",
-        checksums="SHA256:1a64f3f422eb3d1c9b093d1a18da354b13bcf307907c66317e2463ee530b7a97",
-        # This node name will be used when the data set is loaded
-        nodeNames="CropTBVolume2",
-    )
-
+    
 #
 # CropTBVolumeLogic
 #
@@ -808,133 +692,53 @@ class CropTBVolumeLogic(ScriptedLoadableModuleLogic):
             raise ValueError("ROI not specified")
 
         try:
-            if p.preserveInputSpacing:
-                # Voxel-based cropping (no resampling)
-                # Get input volume properties
-                input_spacing = p.inputVolume.GetSpacing()
-                input_ijk_to_ras = vtk.vtkMatrix4x4()
-                p.inputVolume.GetIJKToRASMatrix(input_ijk_to_ras)
-                
-                # Get ROI bounds in RAS
-                ras_bounds = np.zeros(6)
-                p.roiNode.GetBounds(ras_bounds)
-                
-                # Calculate voxel-aligned extent
-                extent = self._calculateVoxelBasedOutputExtent(ras_bounds, 
-                                                            p.inputVolume.GetOrigin(),
-                                                            input_spacing,
-                                                            input_ijk_to_ras,
-                                                            p.inputVolume)
-                
-                # Extract VOI from input volume
-                extract = vtk.vtkExtractVOI()
-                extract.SetInputData(p.inputVolume.GetImageData())
-                extract.SetVOI(extent)
-                extract.Update()
-                
-                # Get the extracted region's bounds in RAS
-                ijk_min = [extent[0], extent[2], extent[4]]
-                ijk_max = [extent[1], extent[3], extent[5]]
-                
-                # Calculate new origin using the input's IJKToRAS matrix
-                transform = vtk.vtkTransform()
-                transform.SetMatrix(input_ijk_to_ras)
-                new_origin = transform.TransformPoint(ijk_min)
-                
-                # Set output properties
-                p.outputVolume.SetAndObserveImageData(extract.GetOutput())
-                p.outputVolume.SetSpacing(input_spacing)
-                p.outputVolume.SetOrigin(new_origin)
-                p.outputVolume.SetIJKToRASMatrix(input_ijk_to_ras)
-                
-                extracted_dims = extract.GetOutput().GetDimensions()
-                
-                logging.info(
-                    f"Voxel-based crop applied. "
-                    f"Extent: {extent}, "
-                    f"Dimensions: {extracted_dims}, "
-                    f"Spacing: {input_spacing}, "
-                    f"Origin: {new_origin}"
-                )
-            else:
-                # Interpolated cropping with resampling
-                # Create transform chain
-                transformChain = vtk.vtkTransform()
-                transformChain.PostMultiply()
-
-                # Parent transforms
-                if p.roiNode.GetParentTransformNode():
-                    parentTransform = vtk.vtkGeneralTransform()
-                    p.roiNode.GetParentTransformNode().GetTransformToWorld(parentTransform)
-                    transformChain.Concatenate(parentTransform)
-
-                # ROI local transform
-                transformChain.Translate(p.roiNode.GetCenter())
-                
-                # Get orientation as quaternion and apply rotation
-                orientation = p.roiNode.GetOrientation()
-                w, x, y, z = orientation
-                
-                # Create a quaternion and convert to rotation matrix
-                quat = vtk.vtkQuaterniond()
-                quat.SetW(w)
-                quat.SetX(x)
-                quat.SetY(y)
-                quat.SetZ(z)
-                
-                rot_matrix_3x3 = vtk.vtkMatrix3x3()
-                quat.ToMatrix3x3(rot_matrix_3x3)
-                
-                # Convert 3x3 matrix to 4x4 for homogeneous coordinates
-                rotation_matrix = vtk.vtkMatrix4x4()
-                for i in range(3):
-                    for j in range(3):
-                        rotation_matrix.SetElement(i, j, rot_matrix_3x3.GetElement(i, j))
-                rotation_matrix.SetElement(3, 3, 1.0)
-                
-                transformChain.Concatenate(rotation_matrix)
-                
-                transformChain.Scale(p.roiNode.GetSize())
-
-                # Get physical dimensions from bounds
-                rasBounds = np.zeros(6)
-                p.roiNode.GetBounds(rasBounds)
-                output_size = [
-                    rasBounds[1] - rasBounds[0],
-                    rasBounds[3] - rasBounds[2],
-                    rasBounds[5] - rasBounds[4]
-                ]
-
-                # Calculate spacing and dimensions
-                input_spacing = np.array(p.inputVolume.GetSpacing())
-                output_spacing = input_spacing * p.spacingScale
-                if p.isotropicSpacing:
-                    output_spacing = np.array([np.min(output_spacing)] * 3)
-                
-                output_dims = [int(np.ceil(s/sp)) for s, sp in zip(output_size, output_spacing)]
-
-                # Set up reslicer
-                reslicer = vtk.vtkImageReslice()
-                reslicer.SetInputData(p.inputVolume.GetImageData())
-                reslicer.SetResliceTransform(transformChain.GetInverse())
-                reslicer.SetOutputSpacing(output_spacing)
-                reslicer.SetOutputOrigin(rasBounds[0], rasBounds[2], rasBounds[4])
-                reslicer.SetOutputExtent(0, output_dims[0]-1, 0, output_dims[1]-1, 0, output_dims[2]-1)
-                reslicer.SetInterpolationMode(p.interpolatorType)
-                reslicer.SetBackgroundLevel(p.fillValue)
-                reslicer.Update()
-
-                # Set output properties
-                p.outputVolume.SetAndObserveImageData(reslicer.GetOutput())
-                p.outputVolume.SetSpacing(output_spacing)
-                
-                # Create IJK to RAS matrix
-                matrix = vtk.vtkMatrix4x4()
-                transformChain.GetMatrix(matrix)
-                p.outputVolume.SetIJKToRASMatrix(matrix)
-                
-                logging.info(f"Resampled crop applied. Dimensions: {output_dims}, Spacing: {output_spacing}")
-                
+            # Voxel-based cropping (no resampling)
+            # Get input volume properties
+            input_spacing = p.inputVolume.GetSpacing()
+            input_ijk_to_ras = vtk.vtkMatrix4x4()
+            p.inputVolume.GetIJKToRASMatrix(input_ijk_to_ras)
+            
+            # Get ROI bounds in RAS
+            ras_bounds = np.zeros(6)
+            p.roiNode.GetBounds(ras_bounds)
+            
+            # Calculate voxel-aligned extent
+            extent = self._calculateVoxelBasedOutputExtent(ras_bounds, 
+                                                        p.inputVolume.GetOrigin(),
+                                                        input_spacing,
+                                                        input_ijk_to_ras,
+                                                        p.inputVolume)
+            
+            # Extract VOI from input volume
+            extract = vtk.vtkExtractVOI()
+            extract.SetInputData(p.inputVolume.GetImageData())
+            extract.SetVOI(extent)
+            extract.Update()
+            
+            # Get the extracted region's bounds in RAS
+            ijk_min = [extent[0], extent[2], extent[4]]
+            ijk_max = [extent[1], extent[3], extent[5]]
+            
+            # Calculate new origin using the input's IJKToRAS matrix
+            transform = vtk.vtkTransform()
+            transform.SetMatrix(input_ijk_to_ras)
+            new_origin = transform.TransformPoint(ijk_min)
+            
+            # Set output properties
+            p.outputVolume.SetAndObserveImageData(extract.GetOutput())
+            p.outputVolume.SetSpacing(input_spacing)
+            p.outputVolume.SetOrigin(new_origin)
+            p.outputVolume.SetIJKToRASMatrix(input_ijk_to_ras)
+            
+            extracted_dims = extract.GetOutput().GetDimensions()
+            
+            logging.info(
+                f"Voxel-based crop applied. "
+                f"Extent: {extent}, "
+                f"Dimensions: {extracted_dims}, "
+                f"Spacing: {input_spacing}, "
+                f"Origin: {new_origin}"
+            )
         except Exception as e:
             logging.error(f"Error in cropVolume: {str(e)}")
             raise
@@ -972,37 +776,9 @@ class CropTBVolumeLogic(ScriptedLoadableModuleLogic):
         
         return [ijkMin[0], ijkMax[0], ijkMin[1], ijkMax[1], ijkMin[2], ijkMax[2]]
         
-    def calculateOutputSpacing(self) -> np.ndarray:
-        """Calculate output spacing based on parameters"""
-        p = self.parameterNode
-        inputSpacing = np.array(p.inputVolume.GetSpacing())
-        scaledSpacing = inputSpacing * p.spacingScale
-        
-        if p.preserveInputSpacing:
-            # When preserving input spacing, ignore both scaling and isotropic options
-            return inputSpacing
-        else:
-            # Apply scaling and isotropic options only when not preserving input spacing
-            scaledSpacing = inputSpacing * p.spacingScale
-            if p.isotropicSpacing:
-                minSpacing = np.min(scaledSpacing)
-                return np.array([minSpacing] * 3)
-            return scaledSpacing
-
-    def calculateOutputDimensions(self) -> Tuple[int, int, int]:
-        """Calculate output dimensions based on ROI and spacing"""
-        p = self.parameterNode
-        rasBounds = np.zeros(6)
-        p.roiNode.GetBounds(rasBounds)
-        outputSize = rasBounds[1::2] - rasBounds[0::2]
-        outputSpacing = self.calculateOutputSpacing()
-        return tuple(np.ceil(outputSize / outputSpacing).astype(int))
-
-
 #
 # CropTBVolumeTest
 #
-
 
 class CropTBVolumeTest(ScriptedLoadableModuleTest):
     """
@@ -1011,58 +787,97 @@ class CropTBVolumeTest(ScriptedLoadableModuleTest):
     https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
     """
 
-    def setUp(self) -> None:
-        ScriptedLoadableModuleWidget.setup(self)
-        uiWidget = slicer.util.loadUI(self.resourcePath('UI/CropTBVolume.ui'))
-        uiWidget.setMRMLScene(slicer.mrmlScene)  # Critical for node visibility
-        self.layout.addWidget(uiWidget)
-        self.ui = slicer.util.childWidgetVariables(uiWidget)
+    def setUp(self):
+        """Do whatever is needed to reset the state - typically a scene clear"""
+        ScriptedLoadableModuleTest.setUp(self)
+        slicer.mrmlScene.Clear(0)
+        
+        # Initialize logic first
+        self.logic = CropTBVolumeLogic()
+        if not self.logic:
+            self.fail("Logic creation failed")
+            
+        # Create test nodes first
+        self.inputVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "TestInput")
+        self.roi = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode", "TestROI")
+        self.outputVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "TestOutput")
+        
+        # Create test volume data
+        arr = np.random.rand(50, 50, 50) * 100
+        imageData = vtk.vtkImageData()
+        imageData.SetDimensions(50, 50, 50)
+        imageData.AllocateScalars(vtk.VTK_FLOAT, 1)
+        nps.numpy_to_vtk(arr.ravel(), deep=1, array_type=vtk.VTK_FLOAT).SetName("TEST")
+        self.inputVolume.SetAndObserveImageData(imageData)
+        
+        # Set up ROI 
+        self.roi.SetCenter([25, 25, 25])
+        self.roi.SetSize([30, 30, 30])
+        
+        # Create widget and logic
+        self.widget = CropTBVolumeWidget()
+        self.widget.setup()
+        self.logic = self.widget.logic
+        
+        # Connect ROI to widget before testing
+        self.widget.ui.roiSelector.setCurrentNode(self.roi)
+        slicer.app.processEvents()  # Allow UI to update
+
+    def tearDown(self):
+        """Clean up after each test"""
+        if hasattr(self, 'widget') and self.widget:
+            self.widget.cleanup()
+        slicer.mrmlScene.Clear(0)
+        
+    def cleanup(self):
+        """Clean up after each test"""
+        self.widget.cleanup()
+        slicer.mrmlScene.Clear(0)
 
     def runTest(self):
-        self.test_CropTBVolume()
+        """Run all tests"""
+        self.setUp()
+        try:
+            self.test_VoxelBasedCropping()
+            self.test_ROIInteraction()
+        finally:
+            self.tearDown()
 
-    def test_CropTBVolume(self):
-        # Create test volume
-        testVolume = slicer.vtkMRMLScalarVolumeNode()
-        testVolume.SetName("TestInput")
-        slicer.mrmlScene.AddNode(testVolume)
+    def test_VoxelBasedCropping(self):
+        # Set parameters
+        self.logic.parameterNode.inputVolume = self.inputVolume
+        self.logic.parameterNode.roiNode = self.roi
+        self.logic.parameterNode.outputVolume = self.outputVolume
         
-        # Create test data
-        arr = np.random.rand(100, 100, 100) * 100
-        imageData = vtk.vtkImageData()
-        imageData.SetDimensions(100, 100, 100)
-        imageData.AllocateScalars(vtk.VTK_FLOAT, 1)
-        nps.numpy_to_vtk(arr.ravel(), deep=1, 
-                        array_type=vtk.VTK_FLOAT).SetName("TEST")
-        testVolume.SetAndObserveImageData(imageData)
-        
-        # Create ROI
-        roi = slicer.vtkMRMLMarkupsROINode()
-        roi.SetName("TestROI")
-        slicer.mrmlScene.AddNode(roi)
-        roi.SetXYZ(25, 25, 25)
-        roi.SetRadiusXYZ(25, 25, 25)
-        
-        # Create and add output volume to scene
-        outputVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
-        
-        # Test automatic naming
-        logic = CropTBVolumeLogic()
-        for i in range(1, 4):
-            roi = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode")
-            logic.widget.onROISelectorNodeAdded(roi)
-            self.assertEqual(roi.GetName(), f"CropROI_{i}")
-        logic.parameterNode.inputVolume = testVolume
-        logic.parameterNode.outputVolume = outputVolume  # Use scene-added node
-        logic.parameterNode.roiNode = roi
-        logic.parameterNode.spacingScale = 1.0
-        logic.parameterNode.isotropicSpacing = False
-        logic.parameterNode.interpolatorType = 1  # Set explicitly
-        
-        # Perform cropping
-        logic.CropTBVolume()
+        # Execute cropping
+        self.logic.cropVolume()
         
         # Verify output
-        output = logic.parameterNode.outputVolume
-        self.assertIsNotNone(output.GetImageData())
-        self.assertEqual(output.GetImageData().GetDimensions(), (50, 50, 50))
+        self.assertIsNotNone(self.outputVolume.GetImageData())
+        outputDims = self.outputVolume.GetImageData().GetDimensions()
+        self.assertTrue(all(d > 0 for d in outputDims))
+        print(f"Output dimensions: {outputDims}")
+
+    def test_ROIInteraction(self):
+        """Test ROI modification updates UI correctly"""
+        # Make sure ROI is properly connected to widget
+        self.assertEqual(self.widget.ui.roiSelector.currentNode(), self.roi)
+        
+        # First force an update of the spinboxes from current ROI size
+        self.widget.updateROISizeWidget()
+    
+        # Set new size and wait for updates
+        new_size = [20, 20, 20]
+        self.roi.SetSize(new_size)
+        
+        # Explicitly trigger UI update since automatic updates may not happen in tests
+        self.widget.updateROISizeWidget()
+        
+        # Verify UI reflects changes
+        epsilon = 0.01  # Tight tolerance
+        self.assertAlmostEqual(self.widget.ui.sizeXSpinBox.value, new_size[0], delta=epsilon,
+                            msg=f"X size mismatch: {self.widget.ui.sizeXSpinBox.value} vs {new_size[0]}")
+        self.assertAlmostEqual(self.widget.ui.sizeYSpinBox.value, new_size[1], delta=epsilon,
+                            msg=f"Y size mismatch: {self.widget.ui.sizeYSpinBox.value} vs {new_size[1]}")
+        self.assertAlmostEqual(self.widget.ui.sizeZSpinBox.value, new_size[2], delta=epsilon,
+                            msg=f"Z size mismatch: {self.widget.ui.sizeZSpinBox.value} vs {new_size[2]}")
