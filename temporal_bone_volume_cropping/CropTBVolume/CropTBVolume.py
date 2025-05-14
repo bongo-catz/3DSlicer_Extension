@@ -22,9 +22,11 @@ from slicer.parameterNodeWrapper import (
 )
 
 # Qt imports
-from qt import QPushButton, QTimer
+from qt import QPushButton, QTimer, QMessageBox
 
 RENAMED_EVENT = vtk.vtkCommand.UserEvent + 1  # Typically vtkCommand.UserEvent + 1 is used for renamed events
+DEFAULT_ROI_SIZE = [5.12, 5.12, 5.12] # mm
+ROI_LOCKED = True # Default state
 
 #
 # CropTBVolumeParameterNode
@@ -63,6 +65,8 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._roiUpdateTimer.timeout.connect(self.updateROISizeWidget)
         self.inputVolumeObserverTag = None
         self.outputVolumeObserverTag = None
+        self.roiLocked = ROI_LOCKED # Track ROI Lock state
+        self.tempMarkupNode = None
 
     def setup(self) -> None:
         ScriptedLoadableModuleWidget.setup(self)
@@ -94,37 +98,312 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.roiVisibilityButton.toggled.connect(self.onROIVisibilityToggled)
         
         # Set MRML Scene for selectors
-        selectors = [self.ui.inputSelector, self.ui.outputSelector, self.ui.roiSelector]
-        for selector in selectors:
-            selector.setMRMLScene(slicer.mrmlScene)
-            selector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNode)
-    
-        self.ui.roiSelector.connect("nodeAddedByUser(vtkMRMLNode*)", self.onROISelectorNodeAdded)  
+        self.ui.inputSelector.setMRMLScene(slicer.mrmlScene)
+        self.ui.outputSelector.setMRMLScene(slicer.mrmlScene)
+        self.ui.roiSelector.setMRMLScene(slicer.mrmlScene)
         
+        # Connect signals
+        self.ui.inputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNode)
+        self.ui.outputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onOutputVolumeChanged)
+        self.ui.roiSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNode)
+        
+        # Configure ROI selector
+        self.ui.roiSelector.noneEnabled = True
+        self.ui.roiSelector.addEnabled = False  # Disable the "+" button to create new ROIs
+        self.ui.roiSelector.removeEnabled = True  # Keep remove functionality
+        
+        # Connect ROI controls
         self.ui.sizeXSpinBox.connect('valueChanged(double)', self.onROISizeChanged)
         self.ui.sizeYSpinBox.connect('valueChanged(double)', self.onROISizeChanged)
         self.ui.sizeZSpinBox.connect('valueChanged(double)', self.onROISizeChanged)
         
+        # Connect buttons
         self.ui.fitToVolumeButton.connect('clicked()', self.onFitToVolume)
         self.ui.applyButton.connect('clicked(bool)', self.onApply)
+        self.ui.createROIFromPointButton.connect('clicked(bool)', self.onCreateROIFromPoint)
+        self.ui.roiLockButton.toggled.connect(self.onROILockToggled)
+    
+        # Set initial ROI size to default
+        self.ui.sizeXSpinBox.value = DEFAULT_ROI_SIZE[0]
+        self.ui.sizeYSpinBox.value = DEFAULT_ROI_SIZE[1]
+        self.ui.sizeZSpinBox.value = DEFAULT_ROI_SIZE[2]
+        
+        # Set initial locked state
+        self.setROIControlsEnabled(False)
+        self.ui.roiLockButton.setChecked(False)
+        
+        # Initial UI state - disable controls until ROI is created
+        self.setControlsEnabled(False)
+        self.updateVolumeInfo()
+
+    def setControlsEnabled(self, enabled):
+        """Enable/disable all controls except input selector"""
+        self.ui.outputSelector.setEnabled(enabled)
+        self.ui.roiSelector.setEnabled(enabled)
+        self.ui.fitToVolumeButton.setEnabled(enabled)
+        self.ui.applyButton.setEnabled(enabled)
+        self.setROIControlsEnabled(enabled and not self.roiLocked)
+    
+    def setROIControlsEnabled(self, enabled):
+        """Enable/disable ROI controls"""
+        self.ui.sizeXSpinBox.setEnabled(enabled)
+        self.ui.sizeYSpinBox.setEnabled(enabled)
+        self.ui.sizeZSpinBox.setEnabled(enabled)
+        self.ui.fitToVolumeButton.setEnabled(enabled)
+        
+        # Update ROI interactive state
+        self.updateROILockState()
+        
+        # Invalidate views if disabling to indicate ROI is locked
+        if not enabled:
+            slicer.util.forceRenderAllViews()
             
-        # Add observers for ROI size changes
+    def onCreateROIFromPoint(self):
+        """Stable point selection that works across Slicer versions"""
+        selectedInputNode = self.ui.inputSelector.currentNode()
+        if selectedInputNode is None:
+            QMessageBox.warning(None, "Error", "Please select an input volume first")
+            return
+        
+        logging.info(f"The selected input volume name is: {self._parameterNode.inputVolume.GetName()}")
+        
+        # Confirm user wants to enter point selection mode
+        result = QMessageBox.question(
+            None, "Create ROI from Point\n", 
+            "Left click in ANY SLICE VIEW (axial, saggital, coronal) to place the ROI center point.\n"
+            "\nPress [Esc] key to cancel.",
+            QMessageBox.Yes | QMessageBox.No)
+        
+        logging.info(f"User selected: {'Yes' if result == QMessageBox.Yes else 'No'} (1st Prompt)")
+        
+        if result == QMessageBox.No:
+            return
+        
+        # Create temporary markup node
+        self.tempMarkupNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode', 'TempROIPoint')
+        self.tempMarkupNode.CreateDefaultDisplayNodes()
+        displayNode = self.tempMarkupNode.GetDisplayNode()
+        
+        # Version-compatible display settings
+        try:
+            # Slicer 5.0+ style
+            displayNode.SetGlyphType(displayNode.Sphere3D)
+        except:
+            # Fallback for older versions
+            displayNode.SetGlyphTypeFromString('Sphere')
+        displayNode.SetGlyphScale(3.0)
+        displayNode.SetSelectedColor(1,1,0) # Yellow
+        displayNode.SetTextScale(0) # Hide text
+        
+        # Clear any pending mouse events
+        slicer.app.processEvents()
+        
+        # Set up mouse click observers
+        self.observerTags = []
+        self.sliceWidgets = []
+        layoutManager = slicer.app.layoutManager()
+        
+        # Observe all slice views
+        for sliceViewName in ['Red', 'Yellow', 'Green']:
+            sliceWidget = layoutManager.sliceWidget(sliceViewName)
+            if sliceWidget:
+                self.sliceWidgets.append(sliceWidget)
+                interactor = sliceWidget.sliceView().interactor()
+                # Observe left mouse clicks
+                tag = interactor.AddObserver(vtk.vtkCommand.LeftButtonPressEvent, self.onSliceClick)
+                self.observerTags.append((interactor, tag))
+                # Observe Escape key
+                tag_esc = interactor.AddObserver(vtk.vtkCommand.KeyPressEvent, self.onKeyPress)
+                self.observerTags.append((interactor, tag_esc))
+
+        # Initialize status message
+        slicer.util.showStatusMessage("Click in any slice view to place ROI center. Press Esc to cancel.")
+
+    def onSliceClick(self, interactor, event):
+        """Handle slice view mouse clicks"""
+        try:
+            # Find which slice widget was clicked
+            for sliceWidget in self.sliceWidgets:
+                if sliceWidget.sliceView().interactor() == interactor:
+                    x, y = interactor.GetEventPosition()
+                    
+                    # Convert click to RAS coordinates
+                    sliceView = sliceWidget.sliceView()
+                    xy = [x, y]
+                    xyz = list(sliceView.convertDeviceToXYZ(xy))  # Returns QList<double> [x,y,z]
+                    ras = list(sliceView.convertXYZToRAS(xyz))    # Returns QList<double> [R,A,S]
+                    
+                    # Add visual feedback
+                    self.tempMarkupNode.RemoveAllControlPoints()
+                    self.tempMarkupNode.AddControlPoint(ras[0], ras[1], ras[2])
+                    
+                    # Confirm placement after short delay
+                    QTimer.singleShot(100, lambda: self.confirmAndCreateROI(ras))
+                    self.cleanupObservers()
+                    return 1  # Prevent default handling
+                    
+        except Exception as e:
+            logging.error(f"Error in onSliceClick: {str(e)}")
+            self.cleanupObservers()
+            return 1
+
+    def onKeyPress(self, interactor, event):
+        """Handle Escape key cancellation"""
+        key = interactor.GetKeySym()
+        if key == 'Escape':
+            logging.info("User clicked [Esc] on placing ROI center point")
+            self.cleanupObservers()
+            slicer.mrmlScene.RemoveNode(self.tempMarkupNode)
+            slicer.util.showStatusMessage("ROI placement cancelled.")
+        return 1
+    
+    def convertClickToRAS(self, sliceWidget, x, y):
+        """Convert mouse click position to RAS coordinates"""
+        try:
+            sliceView = sliceWidget.sliceView()
+            ras = [0,0,0]
+            # Convert mouse position to RAS using slice view's coordinate system
+            sliceView.convertDeviceToXYZ(x, y, ras)
+            return ras
+        except Exception as e:
+            logging.error(f"Coordinate conversion failed: {str(e)}")
+            return None
+    
+    def cleanupObservers(self):
+        """Remove all temporary observers"""
+        for interactor, tag in self.observerTags:
+            interactor.RemoveObserver(tag)
+        self.observerTags = []
+        self.sliceWidgets = []
+        slicer.util.showStatusMessage("")
+
+    def confirmAndCreateROI(self, rasPoint):
+        """Handle confirmation after event processing completes"""
+        try:
+            # Show confirmation dialog
+            confirm = QMessageBox.question(
+                None, "Confirm Position",
+                f"Create ROI at:\nX: {rasPoint[0]:.1f}\nY: {rasPoint[1]:.1f}\nZ: {rasPoint[2]:.1f}",
+                QMessageBox.Yes|QMessageBox.No)
+            
+            logging.info(f"User selected: {'Yes' if confirm == QMessageBox.Yes else 'No'} (2nd Prompt)")
+            
+            if confirm == QMessageBox.Yes:
+                self.createROIAtPoint(rasPoint)
+            else:
+                # Restart placement if user wants to try again
+                self.onCreateROIFromPoint()
+                
+        finally:
+            # Ensure cleanup happens in all cases
+            self.exitPlacementMode()
+ 
+    def createROIAtPoint(self, rasPoint):
+        """Create ROI at specified point"""
+        logging.info("Creating ROI at Point!")
+        if not self._parameterNode:
+            return
+        
+         # Generate unique name
+        base_name = "CropROI"
+        existing_names = [n.GetName() for n in slicer.util.getNodesByClass("vtkMRMLMarkupsROINode") 
+                        if n.GetName().startswith(base_name)]
+        
+        # Find next available number
+        i = 1
+        new_name = f"{base_name}_{i}"
+        while f"{base_name}_{i}" in existing_names:
+            i += 1
+            new_name = f"{base_name}_{i}"
+            
+        # Create new ROI
+        roiNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsROINode', new_name)
+        roiNode.CreateDefaultDisplayNodes()
+        roiNode.SetCenter(rasPoint)
+        roiNode.SetSize(DEFAULT_ROI_SIZE)
+        
+        # Configure appearance
+        displayNode = roiNode.GetDisplayNode()
+        displayNode.SetVisibility(True)
+        displayNode.SetSelectedColor(0,1,0)
+        displayNode.SetColor(0,1,0)
+        
+        # Update UI
+        self._parameterNode.roiNode = roiNode
+        self.ui.roiSelector.setCurrentNode(roiNode)
         self.updateROISizeWidget()
+        self.setControlsEnabled(True)  # Enable other controls now that we have ROI
+        slicer.util.resetSliceViews()
+            
+        # Update lock state for new ROI
+        self.updateROILockState()
         
-        # Connect fitToVolume signal to update display
-        self.ui.fitToVolumeButton.clicked.connect(self.updateROISizeWidget)
+    def exitPlacementMode(self):
+        """Safely exit placement mode"""
+        # Exit placement mode
+        interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+        if interactionNode and interactionNode.GetCurrentInteractionMode() == interactionNode.Place:
+            interactionNode.SetCurrentInteractionMode(interactionNode.ViewTransform)
         
-        # Disable ROI and output selectors initially
-        self.ui.roiSelector.setEnabled(False)
-        self.ui.outputSelector.setEnabled(False)
+        # Clean up observers
+        if hasattr(self, 'pointPlacementObserverTag') and hasattr(self, 'tempMarkupNode'):
+            try:
+                self.tempMarkupNode.RemoveObserver(self.pointPlacementObserverTag)
+            except:
+                pass
+            del self.pointPlacementObserverTag
         
-        # Modify the selector connections to include info updates
-        self.ui.inputSelector.connect("currentNodeChanged(vtkMRMLNode*)", lambda: self.updateParameterNodeAndInfo())
-        # Modify output selector connection
-        self.ui.outputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onOutputVolumeChanged)
+        # Remove temp node
+        if hasattr(self, 'tempMarkupNode') and self.tempMarkupNode:
+            try:
+                slicer.mrmlScene.RemoveNode(self.tempMarkupNode)
+            except:
+                pass
+            self.tempMarkupNode = None
+            
+    def onROILockToggled(self, unlocked):
+        """Handle ROI lock/unlock toggle using global ROI_LOCKED default"""
+        if unlocked:
+            # Show confirmation dialog when unlocking
+            result = QMessageBox.question(
+                None, "Confirm ROI Edit", 
+                "Are you sure you want to edit the ROI?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if result == QMessageBox.No:
+                self.ui.roiLockButton.setChecked(False)
+                unlocked = False
+            logging.info(f"User selected: {'Yes' if result == QMessageBox.Yes else 'No'} (ROI Locking)")
+        self.roiLocked = not unlocked
+        self.setROIControlsEnabled(unlocked)
+        self.ui.roiLockButton.setText("Lock ROI" if unlocked else "Unlock ROI")
+        self.updateROILockState()
+    
+    def updateROILockState(self):
+        """Update the ROI's interactive state based on lock status"""
+        roiNode = self.ui.roiSelector.currentNode()
+        if not hasattr(self, '_parameterNode') or not self._parameterNode or roiNode is None:
+            return
         
-        self.updateVolumeInfo()  # This is the proper place to call it
+        displayNode = roiNode.GetDisplayNode()
+        if not displayNode:
+            return
         
+         # Safely update interaction for ROI
+        try:
+            displayNode.SetHandlesInteractive(not self.roiLocked)
+        except AttributeError:
+            logging.warning("ROI display node does not support SetHandlesInteractive")
+
+        # Lock ROI geometry to disable movement
+        try:
+            roiNode.SetLocked(self.roiLocked)
+        except AttributeError:
+            logging.warning("ROI node does not support SetLocked")
+
+        # Force view update
+        slicer.util.forceRenderAllViews()
+
     def updateParameterNodeAndInfo(self):
         """Update parameter node and only input volume information"""
         self.updateParameterNode()
@@ -168,12 +447,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.ui.outputInfoLabel.setText("Output: (error)")
         else:
             self.ui.outputInfoLabel.setText("Output: ")
-    
-    def onNodeAdded(self, caller, event, callData):
-        node = callData
-        if isinstance(node, slicer.vtkMRMLMarkupsROINode):
-            logging.debug(f"New ROI added: {node.GetName()}")
-            self.onROISelectorNodeAdded(node)
     
     def updateParameterNode(self):
         """Update parameter node with additional validation"""
@@ -223,6 +496,8 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.updateVolumeInfo()
     
     def cleanup(self) -> None:
+        """Clean up when module is closed"""
+            
         # Clean up rename observers
         if hasattr(self, '_parameterNode') and self._parameterNode:
             if hasattr(self, 'inputVolumeObserverTag') and self.inputVolumeObserverTag:
@@ -337,16 +612,20 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onApply(self) -> None:
         with slicer.util.tryWithErrorDisplay("Failed to crop volume.", waitCursor=True):
-            if not self._parameterNode or not self._parameterNode.inputVolume:
+            selectedInputNode = self.ui.inputSelector.currentNode()
+            if selectedInputNode is None:
+                QMessageBox.warning(None, "Error", "Please select an input volume first")
                 raise ValueError("Input volume not selected")
             
             # Auto-name output volume if none exists
-            if not self._parameterNode.outputVolume:
+            selectedOutputNode = self.ui.outputSelector.currentNode()
+            if selectedOutputNode is None:
                 self._autoCreateOutputVolume()
                 
             if not self._parameterNode.outputVolume:
                 raise ValueError("Output volume not created")
-                
+            
+            logging.info(f"The created output volume name is: {self._parameterNode.outputVolume.GetName()}")
             self.logic.cropVolume()
             slicer.util.resetSliceViews()
             self.updateVolumeInfo()
@@ -369,49 +648,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             abs(new_size[2]-current_size[2]) > 0.01):
             roi.SetSize(new_size)
             roi.SetCenter(center)
-
-    def onROISelectorNodeAdded(self, node):
-        """Handle new ROI creation with automatic naming and visibility control"""
-        try:
-            # Create display nodes if they don't exist
-            if not node.GetDisplayNode():
-                node.CreateDefaultDisplayNodes()
-            
-            # Set up ROI properties
-            displayNode = node.GetDisplayNode()
-            if displayNode:
-                displayNode.SetVisibility(True)  # Make sure ROI is initially visible
-            
-            # Generate unique name
-            base_name = "CropROI"
-            existing_names = [n.GetName() for n in slicer.util.getNodesByClass("vtkMRMLMarkupsROINode") 
-                            if n.GetName().startswith(base_name)]
-            
-            # Find next available number
-            i = 1
-            while f"{base_name}_{i}" in existing_names:
-                i += 1
-            node.SetName(f"{base_name}_{i}")
-            
-            # Store reference to current ROI
-            self._parameterNode.roiNode = node
-            self.ui.roiSelector.setCurrentNode(node)
-            
-            # Initialize visibility button state
-            if hasattr(self.ui, 'roiVisibilityButton'):
-                self.ui.roiVisibilityButton.setChecked(False)
-                self.ui.roiVisibilityButton.setText("Hide ROI")
-            
-            # Set up observers for this ROI
-            self.setupROIObservers(node)
-            
-            # Auto-create output volume if input exists
-            if self._parameterNode.inputVolume and not self._parameterNode.outputVolume:
-                self._autoCreateOutputVolume()
-
-            self.onFitToVolume()
-        except Exception as e:
-            logging.error(f"Error in onROISelectorNodeAdded: {str(e)}")
     
     def _autoCreateOutputVolume(self):
         """Automatically create and name output volume based on input name"""
@@ -474,6 +710,8 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             if displayNode:
                 tag = displayNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onROIModified)
                 self.roiObservers.append((displayNode, tag))
+                
+            self.updateROILockState()
         
         self.updateROISizeWidget()
             
