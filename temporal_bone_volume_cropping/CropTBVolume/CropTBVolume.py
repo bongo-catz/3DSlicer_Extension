@@ -403,50 +403,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # Force view update
         slicer.util.forceRenderAllViews()
-
-    def updateParameterNodeAndInfo(self):
-        """Update parameter node and only input volume information"""
-        self.updateParameterNode()
-
-        # Handle input volume info
-        if self._parameterNode:
-            if self._parameterNode.inputVolume is not None:  # Explicit None check
-                try:
-                    inputSpacing = self._parameterNode.inputVolume.GetSpacing()
-                    inputImageData = self._parameterNode.inputVolume.GetImageData()
-                    if inputImageData:
-                        inputDims = inputImageData.GetDimensions()
-                        self.ui.inputInfoLabel.setText(
-                            f"Input: {inputDims[0]}x{inputDims[1]}x{inputDims[2]} "
-                            f"({inputSpacing[0]:.2f}x{inputSpacing[1]:.2f}x{inputSpacing[2]:.2f} mm)")
-                    else:
-                        self.ui.inputInfoLabel.setText("Input: (no image data)")
-                except Exception as e:
-                    logging.error(f"Error updating input info: {str(e)}")
-                    self.ui.inputInfoLabel.setText("Input: (error)")
-            else:
-                # Explicitly handle None case
-                self.ui.inputInfoLabel.setText("Input: (none)")
-        else:
-            self.ui.inputInfoLabel.setText("Input: ")
-        
-        # Handle output volume info
-        if self._parameterNode and self._parameterNode.outputVolume is not None:
-            try:
-                outputSpacing = self._parameterNode.outputVolume.GetSpacing()
-                outputImageData = self._parameterNode.outputVolume.GetImageData()
-                if outputImageData:
-                    outputDims = outputImageData.GetDimensions()
-                    self.ui.outputInfoLabel.setText(
-                        f"Output: {outputDims[0]}x{outputDims[1]}x{outputDims[2]} "
-                        f"({outputSpacing[0]:.2f}x{outputSpacing[1]:.2f}x{outputSpacing[2]:.2f} mm)")
-                else:
-                    self.ui.outputInfoLabel.setText("Output: (no image data)")
-            except Exception as e:
-                logging.error(f"Error updating output info: {str(e)}")
-                self.ui.outputInfoLabel.setText("Output: (error)")
-        else:
-            self.ui.outputInfoLabel.setText("Output: ")
     
     def updateParameterNode(self):
         """Update parameter node with additional validation"""
@@ -534,9 +490,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     pass
         ScriptedLoadableModuleWidget.cleanup(self)
 
-    def enter(self) -> None:
-        self.setParameterNode(self.logic.getParameterNode())
-
     def onOutputVolumeChanged(self, node):
         """Handle output volume changes - update info display"""
         if self._parameterNode:
@@ -606,9 +559,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             
         except Exception as e:
             logging.error(f"Error in onROIModified: {str(e)}")
-    
-    def onSceneClosing(self, caller, event) -> None:
-        self.setParameterNode(None)
 
     def onApply(self) -> None:
         with slicer.util.tryWithErrorDisplay("Failed to crop volume.", waitCursor=True):
@@ -687,33 +637,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         while f"Cropped_{base_name}_{i}" in existing_names:
             i += 1
         return f"Cropped_{base_name}_{i}"
-
-    def setupROIObservers(self, roiNode):
-        """Set up observers for ROI modifications and renames"""  
-        # Remove existing observers
-        for observer in self.roiObservers:
-            if isinstance(observer, tuple):
-                caller, tag = observer
-                caller.RemoveObserver(tag)
-        self.roiObservers = []
-        
-        if roiNode:
-            # Observe ROI modifications
-            tag = roiNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onROIModified)
-            self.roiObservers.append((roiNode, tag))
-            
-            # Observe ROI renames
-            tag = roiNode.AddObserver(RENAMED_EVENT, self.onROIRenamed)
-            self.roiObservers.append((roiNode, tag))
-            
-            displayNode = roiNode.GetDisplayNode()
-            if displayNode:
-                tag = displayNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onROIModified)
-                self.roiObservers.append((displayNode, tag))
-                
-            self.updateROILockState()
-        
-        self.updateROISizeWidget()
             
     def onROIVisibilityToggled(self, checked):
         """Toggle ROI visibility with better error handling"""
