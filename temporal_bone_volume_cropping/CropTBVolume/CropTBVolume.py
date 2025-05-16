@@ -25,7 +25,7 @@ from slicer.parameterNodeWrapper import (
 from qt import QPushButton, QTimer, QMessageBox
 
 RENAMED_EVENT = vtk.vtkCommand.UserEvent + 1  # Typically vtkCommand.UserEvent + 1 is used for renamed events
-DEFAULT_ROI_SIZE = [5.12, 5.12, 5.12] # mm
+DEFAULT_ROI_SIZE = [51.2, 51.2, 51.2] # mm
 ROI_LOCKED = True # Default state
 
 #
