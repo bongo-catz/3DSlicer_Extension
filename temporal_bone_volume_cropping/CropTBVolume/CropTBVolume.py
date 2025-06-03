@@ -105,7 +105,12 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Connect signals
         self.ui.inputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNode)
         self.ui.outputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onOutputVolumeChanged)
-        self.ui.roiSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNode)
+        # self.ui.roiSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNode)
+        
+        self.ui.roiSelector.connect(
+            "currentNodeChanged(vtkMRMLNode*)", 
+            lambda node: [self.updateParameterNode(), self.checkApplyButtonEnabled()]
+        )
         
         # Configure ROI selector
         self.ui.roiSelector.noneEnabled = True
@@ -136,6 +141,15 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.setControlsEnabled(False)
         self.updateVolumeInfo()
 
+    def checkApplyButtonEnabled(self):
+        """Enable Apply button only when both input volume and ROI are selected"""
+        inputNode = self.ui.inputSelector.currentNode()
+        roiNode = self.ui.roiSelector.currentNode()
+        if inputNode is not None and roiNode is not None:
+            self.ui.applyButton.setEnabled(True)
+        else:
+            self.ui.applyButton.setEnabled(False)
+        
     def setControlsEnabled(self, enabled):
         """Enable/disable all controls except input selector"""
         self.ui.outputSelector.setEnabled(enabled)
@@ -450,6 +464,7 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     
         # Force UI update
         self.updateVolumeInfo()
+        self.checkApplyButtonEnabled()
     
     def cleanup(self) -> None:
         """Clean up when module is closed"""
@@ -579,6 +594,14 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.cropVolume()
             slicer.util.resetSliceViews()
             self.updateVolumeInfo()
+            
+            # Show success message
+            QMessageBox.information(
+                None,
+                "Cropping Completed",
+                f"Cropping Succesful!\n\nOutput Volume Name: {self._parameterNode.outputVolume.GetName()}\n\nClick OK to continue.",
+                QMessageBox.Ok
+            )
 
     def onROISizeChanged(self) -> None:
         """Update ROI size while maintaining center position"""
