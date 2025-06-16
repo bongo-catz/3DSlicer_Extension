@@ -23,6 +23,7 @@ from slicer.parameterNodeWrapper import (
 
 # Qt imports
 from qt import QPushButton, QTimer, QMessageBox
+import qt
 
 RENAMED_EVENT = vtk.vtkCommand.UserEvent + 1  # Typically vtkCommand.UserEvent + 1 is used for renamed events
 DEFAULT_ROI_SIZE = [51.2, 51.2, 51.2] # mm
@@ -112,6 +113,17 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             lambda node: [self.updateParameterNode(), self.checkApplyButtonEnabled()]
         )
         
+        # Configure save volume selector
+        self.ui.saveVolumeSelector.setMRMLScene(slicer.mrmlScene)
+        self.ui.saveVolumeSelector.setCurrentNode(None)  # Start with no selection
+        self.ui.saveVolumeSelector.removeEnabled = False  # Disable the remove button
+        self.ui.saveVolumeSelector.noneEnabled = True  # Allow deselecting
+        self.ui.saveVolumeSelector.addEnabled = False  # Disable adding new volumes
+
+        # Save button
+        self.ui.saveButton.connect('clicked()', self.onSaveClicked)
+        self.updateVolumeInfo()
+    
         # Configure ROI selector
         self.ui.roiSelector.noneEnabled = True
         self.ui.roiSelector.addEnabled = False  # Disable the "+" button to create new ROIs
@@ -141,6 +153,73 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.setControlsEnabled(False)
         self.updateVolumeInfo()
 
+    def onSaveClicked(self):
+        """Handle save button click with proper volume selection and error handling"""
+        try:
+            # Get selected volume - use output volume if available, otherwise allow any selection
+            volumeNode = self.ui.saveVolumeSelector.currentNode()
+            if volumeNode is None:
+                if hasattr(self, '_parameterNode') and self._parameterNode and self._parameterNode.outputVolume:
+                    volumeNode = self._parameterNode.outputVolume
+                    self.ui.saveVolumeSelector.setCurrentNode(volumeNode)
+                else:
+                    QMessageBox.warning(self.parent, "Save Error", "Please select a volume to save.")
+                    return
+
+            # Generate default filename
+            defaultFilename = f"{volumeNode.GetName()}.nrrd"
+
+            # Show save file dialog
+            result = qt.QFileDialog.getSaveFileName(
+                slicer.util.mainWindow(),
+                "Save Volume As...",
+                defaultFilename,
+                "NRRD files (*.nrrd);;NIfTI files (*.nii *.nii.gz);;All files (*)"
+            )
+
+            # Handle different return types
+            fileName = result if isinstance(result, str) else result[0]
+            if not fileName:
+                return  # User canceled
+
+            # Append extension if missing
+            if not fileName.lower().endswith(('.nrrd', '.nii', '.nii.gz')):
+                if "nii" in fileName.lower():
+                    fileName += ".nii"
+                else:
+                    fileName += ".nrrd"
+
+            # Save the volume
+            success = slicer.util.saveNode(volumeNode, fileName)
+            if success:
+                QMessageBox.information(
+                    self.parent,
+                    "Save Successful",
+                    f"Volume saved successfully to:\n{fileName}"
+                )
+            else:
+                QMessageBox.warning(
+                    self.parent,
+                    "Save Failed",
+                    "Failed to save volume. Unknown error occurred."
+                )
+
+        except Exception as e:
+            logging.error(f"Unexpected error in save operation: {str(e)}")
+            QMessageBox.critical(
+                self.parent,
+                "Error",
+                f"An unexpected error occurred:\n{str(e)}"
+            )
+
+    
+    def updateSaveVolumeSelector(self):
+        """Update the save volume selector with current output volume"""
+        if hasattr(self, '_parameterNode') and self._parameterNode and self._parameterNode.outputVolume:
+            self.ui.saveVolumeSelector.setCurrentNode(self._parameterNode.outputVolume)
+        else:
+            self.ui.saveVolumeSelector.setCurrentNode(None)
+        
     def checkApplyButtonEnabled(self):
         """Enable Apply button only when both input volume and ROI are selected"""
         inputNode = self.ui.inputSelector.currentNode()
@@ -465,6 +544,7 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Force UI update
         self.updateVolumeInfo()
         self.checkApplyButtonEnabled()
+        self.updateSaveVolumeSelector()
     
     def cleanup(self) -> None:
         """Clean up when module is closed"""
@@ -602,7 +682,10 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 f"Cropping Succesful!\n\nOutput Volume Name: {self._parameterNode.outputVolume.GetName()}\n\nClick OK to continue.",
                 QMessageBox.Ok
             )
-
+            
+            # Auto-select the output volume in the save selector
+            self.ui.saveVolumeSelector.setCurrentNode(self._parameterNode.outputVolume)
+            
     def onROISizeChanged(self) -> None:
         """Update ROI size while maintaining center position"""
         if not self._parameterNode or not self._parameterNode.roiNode:
