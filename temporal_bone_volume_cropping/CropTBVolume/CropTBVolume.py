@@ -113,6 +113,12 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             lambda node: [self.updateParameterNode(), self.checkApplyButtonEnabled()]
         )
         
+        # Add ROI observers after UI is set up
+        self.addROIObservers()
+        
+        # Connect ROI modified signal to update function
+        self.ui.roiSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onROISelectionChanged)
+    
         # Configure save volume selector
         self.ui.saveVolumeSelector.setMRMLScene(slicer.mrmlScene)
         self.ui.saveVolumeSelector.setCurrentNode(None)  # Start with no selection
@@ -153,6 +159,34 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.setControlsEnabled(False)
         self.updateVolumeInfo()
 
+    def addROIObservers(self):
+        """Add observers to current ROI node"""
+        self.removeROIObservers()  # Clean up any existing observers first
+        
+        roiNode = self.ui.roiSelector.currentNode()
+        if roiNode:
+            # Observe ROI modified events
+            tag = roiNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onROIModified)
+            self.roiObservers.append((roiNode, tag))
+            
+            # Also observe display node if it exists
+            displayNode = roiNode.GetDisplayNode()
+            if displayNode:
+                tag = displayNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onROIModified)
+                self.roiObservers.append((displayNode, tag))
+
+    def removeROIObservers(self):
+        """Remove all ROI observers"""
+        for caller, tag in self.roiObservers:
+            caller.RemoveObserver(tag)
+        self.roiObservers = []
+
+    def onROISelectionChanged(self, node):
+        """Handle ROI node selection changes"""
+        self.removeROIObservers()
+        self.addROIObservers()
+        self.updateROISizeWidget()
+    
     def onSaveClicked(self):
         """Handle save button click with proper volume selection and error handling"""
         try:
@@ -417,12 +451,29 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         
         # Configure appearance
         displayNode = roiNode.GetDisplayNode()
-        displayNode.SetVisibility(True)
-        displayNode.SetSelectedColor(0,1,0)
-        displayNode.SetColor(0,1,0)
-        
+        if displayNode:
+            # Always show outline in all views
+            displayNode.SetVisibility(True)
+            try:
+                # Newer Slicer versions use SetVisibility2D
+                displayNode.SetVisibility2D(True)  # Show in slice views
+            except AttributeError:
+                # Fallback for older versions
+                displayNode.SetSliceIntersectionVisibility(True)
+            displayNode.SetVisibility3D(True)  # Show in 3D view
+            
+            # Set outline properties
+            displayNode.SetSelectedColor(0, 1, 0)  # Green when selected/interacting
+            displayNode.SetColor(0.5, 0.5, 0.5)   # Gray when not selected
+            displayNode.SetOpacity(1.0)            # Fully visible outline
+            displayNode.SetFillOpacity(0.0)        # Completely transparent fill
+            displayNode.SetFillVisibility(False)    # Hide fill
+            displayNode.SetOutlineVisibility(True)  # Show outline
+                
         # Update UI
         self._parameterNode.roiNode = roiNode
+        # Force the selector to update its list of available ROIs
+        self.ui.roiSelector.setMRMLScene(slicer.mrmlScene)
         self.ui.roiSelector.setCurrentNode(roiNode)
         self.updateROISizeWidget()
         self.setControlsEnabled(True)  # Enable other controls now that we have ROI
@@ -516,6 +567,11 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # Update input volume reference
             self._parameterNode.inputVolume = inputNode
             
+            logging.info(f"The input volume is: {self._parameterNode.inputVolume.GetName()}")
+            
+            # Focus slice views on the new input volume
+            self.focusSliceViewsOnVolume(inputNode)
+        
             # Update ROI reference if selector has a node
             if self.ui.roiSelector.currentNode():
                 self._parameterNode.roiNode = self.ui.roiSelector.currentNode()
@@ -546,9 +602,74 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.checkApplyButtonEnabled()
         self.updateSaveVolumeSelector()
     
+    def focusSliceViewsOnVolume(self, volumeNode):
+        """Center 2D slice views on the specified volume and display it as the background"""
+        if not volumeNode:
+            return
+
+        try:
+            # Ensure volume has display node and is visible in slice views
+            displayNode = volumeNode.GetDisplayNode()
+            if not displayNode:
+                volumeNode.CreateDefaultDisplayNodes()
+                displayNode = volumeNode.GetDisplayNode()
+            if displayNode:
+                displayNode.SetVisibility(True)
+
+            # Get RAS bounds of the volume
+            bounds = [0] * 6
+            volumeNode.GetRASBounds(bounds)
+            center = [
+                (bounds[0] + bounds[1]) / 2,
+                (bounds[2] + bounds[3]) / 2,
+                (bounds[4] + bounds[5]) / 2,
+            ]
+
+            # Access layout manager and update each slice view
+            layoutManager = slicer.app.layoutManager()
+
+            # Get volume dimensions and spacing
+            imageData = volumeNode.GetImageData()
+            spacing = volumeNode.GetSpacing()
+            dimensions = imageData.GetDimensions()
+
+            # Calculate full physical size of the volume in mm
+            size_mm = [dimensions[i] * spacing[i] for i in range(3)]
+
+            for sliceViewName in ['Red', 'Yellow', 'Green']:
+                sliceWidget = layoutManager.sliceWidget(sliceViewName)
+                if sliceWidget:
+                    sliceLogic = sliceWidget.sliceLogic()
+                    if sliceLogic:
+                        # Set background volume in this slice view
+                        compositeNode = sliceLogic.GetSliceCompositeNode()
+                        compositeNode.SetBackgroundVolumeID(volumeNode.GetID())
+
+                        # Center view on the volume
+                        sliceNode = sliceLogic.GetSliceNode()
+                        sliceNode.JumpSliceByCentering(*center)
+
+                        # Calculate and apply appropriate FOV
+                        viewAxis = sliceNode.GetOrientationString()
+                        if viewAxis == 'Axial':
+                            sliceNode.SetFieldOfView(size_mm[0], size_mm[1], 1)
+                        elif viewAxis == 'Sagittal':
+                            sliceNode.SetFieldOfView(size_mm[1], size_mm[2], 1)
+                        elif viewAxis == 'Coronal':
+                            sliceNode.SetFieldOfView(size_mm[0], size_mm[2], 1)
+
+                        # Refresh the view
+                        sliceLogic.FitSliceToAll()
+
+            slicer.util.forceRenderAllViews()
+
+        except Exception as e:
+            logging.error(f"Error focusing slice views: {str(e)}")
+        
     def cleanup(self) -> None:
         """Clean up when module is closed"""
-            
+        self.removeROIObservers()
+        
         # Clean up rename observers
         if hasattr(self, '_parameterNode') and self._parameterNode:
             if hasattr(self, 'inputVolumeObserverTag') and self.inputVolumeObserverTag:
@@ -650,7 +771,9 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # Filter spurious MRML node events
             if caller == current_roi or caller == current_roi.GetDisplayNode():
                 # Restart the debounce timer
-                self._roiUpdateTimer.start(100)  # 100ms delay
+                # self._roiUpdateTimer.start(100)  # 100ms delay
+                # Update immediately without debouncing
+                self.updateROISizeWidget()
             
         except Exception as e:
             logging.error(f"Error in onROIModified: {str(e)}")
@@ -724,6 +847,9 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             imageData = vtk.vtkImageData()
             output_node.SetAndObserveImageData(imageData)
             
+            # Create default display nodes immediately
+            output_node.CreateDefaultDisplayNodes()
+        
             self._parameterNode.outputVolume = output_node
             if hasattr(self, 'ui') and self.ui and hasattr(self.ui, 'outputSelector'):
                 self.ui.outputSelector.setCurrentNode(output_node)
@@ -795,21 +921,30 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 return
             size = roi.GetSize()
             
-            # Block signals to prevent infinite loops
-            self.ui.sizeXSpinBox.blockSignals(True)
-            self.ui.sizeYSpinBox.blockSignals(True)
-            self.ui.sizeZSpinBox.blockSignals(True)
+            # Only update if values actually changed
+            current_x = self.ui.sizeXSpinBox.value
+            current_y = self.ui.sizeYSpinBox.value
+            current_z = self.ui.sizeZSpinBox.value
             
-            # Update spin boxes with formatted values
-            self.ui.sizeXSpinBox.setValue(round(size[0], 2))
-            self.ui.sizeYSpinBox.setValue(round(size[1], 2))
-            self.ui.sizeZSpinBox.setValue(round(size[2], 2))
-            
-            # Force immediate update
-            self.ui.sizeXSpinBox.repaint()
-            self.ui.sizeYSpinBox.repaint()
-            self.ui.sizeZSpinBox.repaint()
-            
+            if (abs(size[0] - current_x) > 0.01 or
+                abs(size[1] - current_y) > 0.01 or
+                abs(size[2] - current_z) > 0.01):
+                
+                # Block signals to prevent infinite loops
+                self.ui.sizeXSpinBox.blockSignals(True)
+                self.ui.sizeYSpinBox.blockSignals(True)
+                self.ui.sizeZSpinBox.blockSignals(True)
+                
+                # Update spin boxes with formatted values
+                self.ui.sizeXSpinBox.setValue(round(size[0], 2))
+                self.ui.sizeYSpinBox.setValue(round(size[1], 2))
+                self.ui.sizeZSpinBox.setValue(round(size[2], 2))
+                
+                # Force immediate update
+                self.ui.sizeXSpinBox.repaint()
+                self.ui.sizeYSpinBox.repaint()
+                self.ui.sizeZSpinBox.repaint()
+                
         except Exception as e:
             logging.error(f"Error in updateROISizeWidget: {str(e)}")
         finally:
@@ -958,7 +1093,7 @@ class CropTBVolumeLogic(ScriptedLoadableModuleLogic):
         if not p.roiNode:
             raise ValueError("ROI not specified")
 
-        try:
+        try:            
             # Voxel-based cropping (no resampling)
             # Get input volume properties
             input_spacing = p.inputVolume.GetSpacing()
@@ -996,6 +1131,29 @@ class CropTBVolumeLogic(ScriptedLoadableModuleLogic):
             p.outputVolume.SetSpacing(input_spacing)
             p.outputVolume.SetOrigin(new_origin)
             p.outputVolume.SetIJKToRASMatrix(input_ijk_to_ras)
+            
+            # Center 2D slice views on new output volume (but do not modify 3D slice planes)
+            layoutManager = slicer.app.layoutManager()
+            ras_bounds = [0] * 6
+            p.outputVolume.GetRASBounds(ras_bounds)
+            center = [
+                (ras_bounds[0] + ras_bounds[1]) / 2,
+                (ras_bounds[2] + ras_bounds[3]) / 2,
+                (ras_bounds[4] + ras_bounds[5]) / 2,
+            ]
+            for sliceViewName in ['Red', 'Yellow', 'Green']:
+                sliceWidget = layoutManager.sliceWidget(sliceViewName)
+                if sliceWidget:
+                    sliceLogic = sliceWidget.sliceLogic()
+                    if sliceLogic:
+                        compositeNode = sliceLogic.GetSliceCompositeNode()
+                        compositeNode.SetBackgroundVolumeID(p.outputVolume.GetID())
+                        
+                        # Center the slice node on the new cropped volume's center
+                        sliceNode = sliceLogic.GetSliceNode()
+                        sliceNode.JumpSliceByCentering(center[0], center[1], center[2])
+
+            slicer.util.resetSliceViews()
             
             extracted_dims = extract.GetOutput().GetDimensions()
             
