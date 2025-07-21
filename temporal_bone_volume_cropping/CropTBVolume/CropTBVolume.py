@@ -185,6 +185,10 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """Handle ROI node selection changes"""
         self.removeROIObservers()
         self.addROIObservers()
+        if node:
+            displayNode = node.GetDisplayNode()
+            if displayNode:
+                displayNode.SetRotationHandleVisibility(False)
         self.updateROISizeWidget()
     
     def onSaveClicked(self):
@@ -446,6 +450,15 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Create new ROI
         roiNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsROINode', new_name)
         roiNode.CreateDefaultDisplayNodes()
+        # grab its displayNode
+        displayNode = roiNode.GetDisplayNode()
+        if displayNode:
+            # hide the little rotation‐handles so it can only translate & scale
+            try:
+                displayNode.SetRotationHandleVisibility(False)
+            except AttributeError:
+                # fallback name in older versions
+                displayNode.SetHandleRotationVisibility(False)
         roiNode.SetCenter(rasPoint)
         roiNode.SetSize(DEFAULT_ROI_SIZE)
         
@@ -1111,36 +1124,51 @@ class CropTBVolumeLogic(ScriptedLoadableModuleLogic):
                                                         input_ijk_to_ras,
                                                         p.inputVolume)
             
+            # Verify extent is valid
+            input_dims = p.inputVolume.GetImageData().GetDimensions()
+            if (extent[0] < 0 or extent[1] >= input_dims[0] or
+                extent[2] < 0 or extent[3] >= input_dims[1] or
+                extent[4] < 0 or extent[5] >= input_dims[2]):
+                raise ValueError("Calculated extent is outside input volume bounds")
+            
             # Extract VOI from input volume
             extract = vtk.vtkExtractVOI()
             extract.SetInputData(p.inputVolume.GetImageData())
             extract.SetVOI(extent)
             extract.Update()
             
+            outputImage = extract.GetOutput()
+            # Get dimensions before modifying extent
+            dims = outputImage.GetDimensions()
+            
+            # Reset the extent to 0-based for Slicer compatibility
+            outputImage.SetExtent(0, dims[0]-1, 0, dims[1]-1, 0, dims[2]-1)
+            
             # Get the extracted region's bounds in RAS
             ijk_min = [extent[0], extent[2], extent[4]]
-            ijk_max = [extent[1], extent[3], extent[5]]
             
             # Calculate new origin using the input's IJKToRAS matrix
             transform = vtk.vtkTransform()
             transform.SetMatrix(input_ijk_to_ras)
             new_origin = transform.TransformPoint(ijk_min)
             
-            # Set output properties
-            p.outputVolume.SetAndObserveImageData(extract.GetOutput())
-            p.outputVolume.SetSpacing(input_spacing)
-            p.outputVolume.SetOrigin(new_origin)
-            p.outputVolume.SetIJKToRASMatrix(input_ijk_to_ras)
+            # Create a new IJKToRAS matrix for the cropped volume
+            cropped_ijk_to_ras = vtk.vtkMatrix4x4()
+            cropped_ijk_to_ras.DeepCopy(input_ijk_to_ras)
+            cropped_ijk_to_ras.SetElement(0, 3, new_origin[0])
+            cropped_ijk_to_ras.SetElement(1, 3, new_origin[1])
+            cropped_ijk_to_ras.SetElement(2, 3, new_origin[2])
             
-            # Center 2D slice views on new output volume (but do not modify 3D slice planes)
+            # Set output properties
+            p.outputVolume.SetAndObserveImageData(outputImage)
+            p.outputVolume.SetSpacing(input_spacing)
+            p.outputVolume.SetIJKToRASMatrix(cropped_ijk_to_ras)
+            
+            # IMPORTANT: Reset slice views BEFORE setting the new volume
+            slicer.util.resetSliceViews()
+            
+            # Set the new volume as background in all slice views
             layoutManager = slicer.app.layoutManager()
-            ras_bounds = [0] * 6
-            p.outputVolume.GetRASBounds(ras_bounds)
-            center = [
-                (ras_bounds[0] + ras_bounds[1]) / 2,
-                (ras_bounds[2] + ras_bounds[3]) / 2,
-                (ras_bounds[4] + ras_bounds[5]) / 2,
-            ]
             for sliceViewName in ['Red', 'Yellow', 'Green']:
                 sliceWidget = layoutManager.sliceWidget(sliceViewName)
                 if sliceWidget:
@@ -1148,26 +1176,35 @@ class CropTBVolumeLogic(ScriptedLoadableModuleLogic):
                     if sliceLogic:
                         compositeNode = sliceLogic.GetSliceCompositeNode()
                         compositeNode.SetBackgroundVolumeID(p.outputVolume.GetID())
-                        
-                        # Center the slice node on the new cropped volume's center
-                        sliceNode = sliceLogic.GetSliceNode()
-                        sliceNode.JumpSliceByCentering(center[0], center[1], center[2])
-
-            slicer.util.resetSliceViews()
             
-            extracted_dims = extract.GetOutput().GetDimensions()
+            # Calculate center of the cropped volume in RAS
+            p.outputVolume.GetRASBounds(ras_bounds)
+            center = [
+                (ras_bounds[0] + ras_bounds[1]) / 2,
+                (ras_bounds[2] + ras_bounds[3]) / 2,
+                (ras_bounds[4] + ras_bounds[5]) / 2,
+            ]
+            
+            # Center all slice views using the proper method
+            for sliceViewName in ['Red', 'Yellow', 'Green']:
+                sliceWidget = layoutManager.sliceWidget(sliceViewName)
+                if sliceWidget:
+                    sliceNode = sliceWidget.sliceLogic().GetSliceNode()
+                    sliceNode.JumpSliceByCentering(center[0], center[1], center[2])
+
+            slicer.util.forceRenderAllViews()
             
             logging.info(
                 f"Voxel-based crop applied. "
                 f"Extent: {extent}, "
-                f"Dimensions: {extracted_dims}, "
+                f"Dimensions: {dims}, "
                 f"Spacing: {input_spacing}, "
                 f"Origin: {new_origin}"
             )
         except Exception as e:
             logging.error(f"Error in cropVolume: {str(e)}")
             raise
-
+    
     def _calculateVoxelBasedOutputExtent(self, roiBounds, inputOrigin, inputSpacing, ijkToRas, inputVolume):
         """Calculate voxel-aligned extent with proper coordinate handling"""
         rasToIjk = vtk.vtkMatrix4x4()
