@@ -185,10 +185,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """Handle ROI node selection changes"""
         self.removeROIObservers()
         self.addROIObservers()
-        if node:
-            displayNode = node.GetDisplayNode()
-            if displayNode:
-                displayNode.SetRotationHandleVisibility(False)
         self.updateROISizeWidget()
     
     def onSaveClicked(self):
@@ -450,15 +446,6 @@ class CropTBVolumeWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Create new ROI
         roiNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsROINode', new_name)
         roiNode.CreateDefaultDisplayNodes()
-        # grab its displayNode
-        displayNode = roiNode.GetDisplayNode()
-        if displayNode:
-            # hide the little rotation‐handles so it can only translate & scale
-            try:
-                displayNode.SetRotationHandleVisibility(False)
-            except AttributeError:
-                # fallback name in older versions
-                displayNode.SetHandleRotationVisibility(False)
         roiNode.SetCenter(rasPoint)
         roiNode.SetSize(DEFAULT_ROI_SIZE)
         
@@ -1204,7 +1191,7 @@ class CropTBVolumeLogic(ScriptedLoadableModuleLogic):
         except Exception as e:
             logging.error(f"Error in cropVolume: {str(e)}")
             raise
-    
+
     def _calculateVoxelBasedOutputExtent(self, roiBounds, inputOrigin, inputSpacing, ijkToRas, inputVolume):
         """Calculate voxel-aligned extent with proper coordinate handling"""
         rasToIjk = vtk.vtkMatrix4x4()
